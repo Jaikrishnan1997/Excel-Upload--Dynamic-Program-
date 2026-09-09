@@ -1,1 +1,637 @@
+CLASS zcl_excel_upload DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
 
+  PUBLIC SECTION.
+    TYPES:
+      BEGIN OF ty_result,
+        doc_number TYPE char20,        " Generic document reference
+        doc_year   TYPE gjahr,         " Fiscal year / any year
+        material   TYPE matnr18,       " Material (optional)
+        vendor     TYPE lifnr,         " Vendor (optional)
+        plant      TYPE werks_d,       " Plant (optional)
+        msg_type   TYPE bapi_mtype,    " S/E/W/I/A
+        msg_number TYPE symsgno,       " Message Number
+        msg_text   TYPE bapi_msg,      " Full Message Text
+        status     TYPE char10,        " Success / Error / Warning
+        color      TYPE lvc_t_scol,    " Row color for ALV
+      END OF ty_result,
+
+      ty_result_tab TYPE STANDARD TABLE OF ty_result WITH EMPTY KEY.
+    " Constructor — pass file path from selection screen
+    METHODS :
+      constructor
+        IMPORTING iv_filepath TYPE rlgrap-filename
+        RAISING   cx_fdt_excel_core,
+      " Get worksheet names — for selection popup
+      get_sheet_names
+        RETURNING VALUE(rt_sheets) TYPE string_table,
+
+      " Show popup for user to pick a worksheet
+      show_sheet_popup
+        RETURNING VALUE(rv_sheet_name) TYPE string,
+
+      " Main method — reads Excel into ANY typed internal table
+      get_data
+        IMPORTING iv_sheet_index TYPE i DEFAULT 0        " 0 = use name
+                  iv_sheet_name  TYPE string DEFAULT ''   " blank = first sheet
+                  iv_skip_rows   TYPE i DEFAULT 1         " 1 = skip header
+        EXPORTING et_data        TYPE STANDARD TABLE
+        RAISING   cx_fdt_excel_core,
+
+      " Get raw dynamic table (if you want to handle mapping yourself)
+      get_raw_itab
+        IMPORTING iv_sheet_index TYPE i DEFAULT 0
+                  iv_sheet_name  TYPE string DEFAULT ''
+        EXPORTING er_data        TYPE REF TO data
+        RAISING   cx_fdt_excel_core,
+
+      " === NEW: Result logging methods ===
+
+      " Add a single result entry
+      add_result
+        IMPORTING iv_doc_number TYPE clike DEFAULT ''
+                  iv_doc_year   TYPE gjahr DEFAULT '0000'
+                  iv_material   TYPE matnr18 DEFAULT ''
+                  iv_vendor     TYPE lifnr DEFAULT ''
+                  iv_plant      TYPE werks_d DEFAULT ''
+                  iv_msg_type   TYPE bapi_mtype
+                  iv_msg_number TYPE symsgno DEFAULT '000'
+                  iv_msg_text   TYPE clike,
+
+      " Add all messages from a BAPI return table in one call
+      add_bapi_return
+        IMPORTING iv_doc_number TYPE clike DEFAULT ''
+                  iv_doc_year   TYPE gjahr DEFAULT '0000'
+                  iv_material   TYPE matnr18 DEFAULT ''
+                  iv_vendor     TYPE lifnr DEFAULT ''
+                  iv_plant      TYPE werks_d DEFAULT ''
+                  it_return     TYPE bapiret2_t,
+
+      " Get the full result log
+      get_results
+        RETURNING VALUE(rt_results) TYPE ty_result_tab,
+
+      " Clear the result log
+      clear_results,
+
+      " Display result log as SALV
+      show_results
+        IMPORTING iv_title TYPE string DEFAULT 'Upload Results'.
+
+
+
+
+
+    " Utility: F4 help for file selection (static — call before constructor)
+    CLASS-METHODS :
+      file_open_dialog
+        RETURNING VALUE(rv_filepath) TYPE rlgrap-filename,
+
+      " Download template from any structure
+      download_template
+        IMPORTING it_fieldcat TYPE lvc_t_fcat       " column definitions
+                  iv_filename TYPE string DEFAULT 'Upload_Template'
+        RAISING   cx_salv_error.
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+    DATA: mo_excel    TYPE REF TO cl_fdt_xl_spreadsheet,
+          mt_sheets   TYPE string_table,
+          mv_filepath TYPE string,
+          mt_results  TYPE ty_result_tab.
+
+    METHODS:
+      resolve_sheet_name
+        IMPORTING iv_sheet_index       TYPE i
+                  iv_sheet_name        TYPE string
+        RETURNING VALUE(rv_sheet_name) TYPE string,
+
+      get_color_for_type                          " ← add this
+        IMPORTING iv_type         TYPE bapi_mtype
+        RETURNING VALUE(rt_color) TYPE lvc_t_scol,
+
+      get_status_text                             " ← add this
+        IMPORTING iv_type          TYPE bapi_mtype
+        RETURNING VALUE(rv_status) TYPE char10.
+ENDCLASS.
+
+
+
+CLASS ZCL_EXCEL_UPLOAD IMPLEMENTATION.
+
+
+  METHOD constructor.
+
+    DATA: lt_records    TYPE solix_tab,
+          lv_xstring    TYPE xstring,
+          lv_filelength TYPE i.
+
+    mv_filepath = iv_filepath.
+
+    " Step 1: Upload binary from frontend
+    CALL FUNCTION 'GUI_UPLOAD'
+      EXPORTING
+        filename   = CONV string( iv_filepath )
+        filetype   = 'BIN'
+      IMPORTING
+        filelength = lv_filelength
+        header     = lv_xstring
+      TABLES
+        data_tab   = lt_records
+      EXCEPTIONS
+        OTHERS     = 1.
+
+    IF sy-subrc <> 0.
+      RAISE EXCEPTION TYPE cx_fdt_excel_core.
+    ENDIF.
+
+    " Step 2: Binary → xstring
+    CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+      EXPORTING
+        input_length = lv_filelength
+      IMPORTING
+        buffer       = lv_xstring
+      TABLES
+        binary_tab   = lt_records
+      EXCEPTIONS
+        OTHERS       = 1.
+
+    IF sy-subrc <> 0.
+      RAISE EXCEPTION TYPE cx_fdt_excel_core.
+    ENDIF.
+
+    " Step 3: Create spreadsheet instance
+    mo_excel = NEW cl_fdt_xl_spreadsheet(
+      document_name = CONV string( iv_filepath )
+      xdocument     = lv_xstring ).
+
+    " Step 4: Cache sheet names
+    mo_excel->if_fdt_doc_spreadsheet~get_worksheet_names(
+      IMPORTING worksheet_names = mt_sheets ).
+
+  ENDMETHOD.
+
+
+  METHOD get_sheet_names.
+    rt_sheets = mt_sheets.
+  ENDMETHOD.
+
+
+  METHOD show_sheet_popup.
+
+    " If only one sheet — pick it automatically, no popup
+    IF lines( mt_sheets ) = 1.
+      READ TABLE mt_sheets INTO rv_sheet_name INDEX 1.
+      RETURN.
+    ENDIF.
+
+    " Multiple sheets — show selection popup
+    DATA: lt_values TYPE STANDARD TABLE OF spopli,
+          ls_value  TYPE spopli.
+
+    LOOP AT mt_sheets INTO DATA(lv_sheet).
+      ls_value-selflag   = COND #( WHEN sy-tabix = 1 THEN 'X' ELSE '' ).
+      ls_value-varoption = lv_sheet.
+      APPEND ls_value TO lt_values.
+    ENDLOOP.
+
+    DATA: lv_answer TYPE char1.
+
+    CALL FUNCTION 'POPUP_TO_DECIDE_LIST'
+      EXPORTING
+        textline1 = 'Select worksheet to upload'
+        titel     = 'Worksheet Selection'
+      IMPORTING
+        answer    = lv_answer
+      TABLES
+        t_spopli  = lt_values.
+
+    IF lv_answer = 'A'.
+      RETURN.      " User cancelled
+    ENDIF.
+
+    READ TABLE lt_values INTO ls_value WITH KEY selflag = 'X'.
+    IF sy-subrc = 0.
+      rv_sheet_name = ls_value-varoption.
+    ENDIF.
+
+  ENDMETHOD.
+
+
+  METHOD resolve_sheet_name.
+
+    IF iv_sheet_name IS NOT INITIAL.
+      " Use provided name directly
+      rv_sheet_name = iv_sheet_name.
+    ELSEIF iv_sheet_index > 0 AND iv_sheet_index <= lines( mt_sheets ).
+      " Use index
+      READ TABLE mt_sheets INTO rv_sheet_name INDEX iv_sheet_index.
+    ELSE.
+      " Default to first sheet
+      READ TABLE mt_sheets INTO rv_sheet_name INDEX 1.
+    ENDIF.
+
+  ENDMETHOD.
+
+
+  METHOD get_raw_itab.
+
+    DATA(lv_sheet) = resolve_sheet_name(
+      iv_sheet_index = iv_sheet_index
+      iv_sheet_name  = iv_sheet_name ).
+
+    er_data = mo_excel->if_fdt_doc_spreadsheet~get_itab_from_worksheet( lv_sheet ).
+
+  ENDMETHOD.
+
+
+  METHOD get_data.
+
+    FIELD-SYMBOLS: <ft_raw>   TYPE STANDARD TABLE,
+                   <fs_row>   TYPE any,
+                   <fv_cell>  TYPE any,
+                   <fs_out>   TYPE any,
+                   <fv_field> TYPE any.
+
+    " Get raw dynamic table from Excel
+    DATA: lr_raw TYPE REF TO data.
+
+    get_raw_itab(
+      EXPORTING iv_sheet_index = iv_sheet_index
+                iv_sheet_name  = iv_sheet_name
+      IMPORTING er_data        = lr_raw ).
+
+    ASSIGN lr_raw->* TO <ft_raw>.
+
+    " Get output table line structure info
+*    DATA(lo_out_line) = CAST cl_abap_structdescr(
+*      cl_abap_tabledescr=>describe_by_data( et_data )->get_table_line_type( ) ).
+*
+*    DATA(lt_out_comps) = lo_out_line->get_components( ).
+    DATA(lo_table_desc) = CAST cl_abap_tabledescr(
+      cl_abap_tabledescr=>describe_by_data( et_data ) ).
+    " Get the structure descriptor from the table's line type attribute
+    DATA(lo_out_line) = CAST cl_abap_structdescr( lo_table_desc->get_table_line_type( ) ).
+    DATA(lt_out_comps) = lo_out_line->get_components( ).
+
+    " Create a single work area for the output line
+    DATA: lr_out_line TYPE REF TO data.
+    CREATE DATA lr_out_line TYPE HANDLE lo_out_line.
+    ASSIGN lr_out_line->* TO <fs_out>.
+
+    " Loop Excel rows (skip header rows as specified)
+    DATA(lv_start) = iv_skip_rows + 1.
+
+    LOOP AT <ft_raw> ASSIGNING <fs_row> FROM lv_start.
+
+      CLEAR <fs_out>.
+      DATA(lv_col) = 0.
+
+      " Map each Excel column → output structure component (by position)
+      LOOP AT lt_out_comps INTO DATA(ls_comp).
+        lv_col += 1.
+
+        ASSIGN COMPONENT lv_col OF STRUCTURE <fs_row> TO <fv_cell>.
+        IF sy-subrc <> 0. CONTINUE. ENDIF.
+
+        ASSIGN COMPONENT ls_comp-name OF STRUCTURE <fs_out> TO <fv_field>.
+        IF sy-subrc <> 0. CONTINUE. ENDIF.
+
+        " Convert string cell value to target type
+        DATA(lv_cell_str) = condense( CONV string( <fv_cell> ) ).
+
+        IF lv_cell_str IS NOT INITIAL.
+          TRY.
+              " Handle special types
+              CASE ls_comp-type->type_kind.
+                WHEN cl_abap_typedescr=>typekind_num.
+                  " NUMC fields: pad with leading zeros
+                  DATA(lv_len) = ls_comp-type->length / cl_abap_char_utilities=>charsize.
+                  <fv_field> = |{ lv_cell_str ALIGN = RIGHT WIDTH = lv_len PAD = '0' }|.
+
+                WHEN OTHERS.
+                  <fv_field> = lv_cell_str.
+              ENDCASE.
+            CATCH cx_root.
+              " Type conversion failed — skip this cell
+              CONTINUE.
+          ENDTRY.
+        ENDIF.
+
+      ENDLOOP.
+
+      " Skip completely blank rows
+      DATA(lv_empty) = abap_true.
+      LOOP AT lt_out_comps INTO ls_comp.
+        ASSIGN COMPONENT ls_comp-name OF STRUCTURE <fs_out> TO <fv_field>.
+        IF <fv_field> IS NOT INITIAL.
+          lv_empty = abap_false.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+
+      IF lv_empty = abap_false.
+        INSERT <fs_out> INTO TABLE et_data.
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDMETHOD.
+
+
+  METHOD file_open_dialog.
+
+    DATA: lt_files TYPE filetable,
+          lv_rc    TYPE i.
+
+    cl_gui_frontend_services=>file_open_dialog(
+      EXPORTING
+        window_title = 'Select Upload File'
+        file_filter  = 'Excel Files (*.xlsx)|*.xlsx|All Files (*.*)|*.*'
+      CHANGING
+        file_table   = lt_files
+        rc           = lv_rc
+      EXCEPTIONS
+        OTHERS       = 1 ).
+
+    IF sy-subrc = 0 AND lines( lt_files ) > 0.
+      rv_filepath = lt_files[ 1 ]-filename.
+    ENDIF.
+
+  ENDMETHOD.
+
+
+  METHOD download_template.
+
+    " Create empty row for template structure
+    DATA: lt_empty TYPE STANDARD TABLE OF string.
+    APPEND '' TO lt_empty.
+
+    " Use SALV to generate XLSX
+    DATA(lo_result) = cl_salv_ex_util=>factory_result_data_table(
+      r_data         = REF #( lt_empty )
+      t_fieldcatalog = it_fieldcat ).
+
+    DATA: lx_data TYPE xstring.
+
+    cl_salv_bs_tt_util=>if_salv_bs_tt_util~transform(
+      EXPORTING
+        xml_type      = if_salv_bs_xml=>c_type_xlsx
+        xml_version   = cl_salv_bs_a_xml_base=>get_version( )
+        r_result_data = lo_result
+        xml_flavour   = if_salv_bs_c_tt=>c_tt_xml_flavour_export
+        gui_type      = if_salv_bs_xml=>c_gui_type_gui
+      IMPORTING
+        xml           = lx_data ).
+
+    DATA(lt_bin) = cl_bcs_convert=>xstring_to_solix( iv_xstring = lx_data ).
+    DATA(lv_flen) = xstrlen( lx_data ).
+
+    DATA: lv_filename TYPE string,
+          lv_path     TYPE string,
+          lv_fullpath TYPE string,
+          lv_action   TYPE i.
+
+    cl_gui_frontend_services=>file_save_dialog(
+      EXPORTING
+        default_file_name = CONV #( iv_filename )
+        default_extension = 'xlsx'
+        file_filter       = 'Excel Workbook (*.xlsx)|*.xlsx'
+      CHANGING
+        filename          = lv_filename
+        path              = lv_path
+        fullpath          = lv_fullpath
+        user_action       = lv_action ).
+
+    IF lv_action <> cl_gui_frontend_services=>action_ok OR lv_fullpath IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    cl_gui_frontend_services=>gui_download(
+      EXPORTING
+        bin_filesize = lv_flen
+        filename     = lv_fullpath
+        filetype     = 'BIN'
+      CHANGING
+        data_tab     = lt_bin
+      EXCEPTIONS
+        OTHERS       = 1 ).
+
+    IF sy-subrc = 0.
+      MESSAGE |Template downloaded: { lv_fullpath }| TYPE 'S'.
+    ENDIF.
+
+  ENDMETHOD.
+
+
+  METHOD add_result.
+
+    APPEND VALUE ty_result(
+      doc_number = iv_doc_number
+      doc_year   = iv_doc_year
+      material   = iv_material
+      vendor     = iv_vendor
+      plant      = iv_plant
+      msg_type   = iv_msg_type
+      msg_number = iv_msg_number
+      msg_text   = iv_msg_text
+      status     = get_status_text( iv_msg_type )
+      color      = get_color_for_type( iv_msg_type )
+    ) TO mt_results.
+
+  ENDMETHOD.
+
+
+  METHOD add_bapi_return.
+
+    IF it_return IS INITIAL.
+      " No messages — treat as success
+      add_result(
+        iv_doc_number = iv_doc_number
+        iv_doc_year   = iv_doc_year
+        iv_material   = iv_material
+        iv_vendor     = iv_vendor
+        iv_plant      = iv_plant
+        iv_msg_type   = 'S'
+        iv_msg_text   = 'Processed successfully' ).
+      RETURN.
+    ENDIF.
+
+    LOOP AT it_return INTO DATA(ls_return).
+      " Skip info/warning if a success or error exists (optional — remove if you want all)
+      CHECK ls_return-type CA 'SEA'.
+
+      add_result(
+        iv_doc_number = iv_doc_number
+        iv_doc_year   = iv_doc_year
+        iv_material   = iv_material
+        iv_vendor     = iv_vendor
+        iv_plant      = iv_plant
+        iv_msg_type   = ls_return-type
+        iv_msg_number = ls_return-number
+        iv_msg_text   = ls_return-message ).
+    ENDLOOP.
+
+    " If only W/I messages existed (no S/E/A), add them
+    IF lines( mt_results ) = 0.
+      LOOP AT it_return INTO ls_return.
+        add_result(
+          iv_doc_number = iv_doc_number
+          iv_doc_year   = iv_doc_year
+          iv_material   = iv_material
+          iv_vendor     = iv_vendor
+          iv_plant      = iv_plant
+          iv_msg_type   = ls_return-type
+          iv_msg_number = ls_return-number
+          iv_msg_text   = ls_return-message ).
+      ENDLOOP.
+    ENDIF.
+
+  ENDMETHOD.
+
+
+  METHOD get_results.
+    rt_results = mt_results.
+  ENDMETHOD.
+
+
+  METHOD clear_results.
+    CLEAR mt_results.
+  ENDMETHOD.
+
+
+  METHOD get_color_for_type.
+
+    DATA(lv_col) = SWITCH i( iv_type
+      WHEN 'S' THEN 5    " Green
+      WHEN 'E' THEN 6    " Red
+      WHEN 'W' THEN 3    " Yellow
+      WHEN 'A' THEN 6    " Red
+      WHEN 'I' THEN 1    " Grey
+      ELSE 0 ).
+
+    rt_color = VALUE #( (
+      fname     = ''
+      color-col = lv_col
+      color-int = 0
+      color-inv = 0
+    ) ).
+
+  ENDMETHOD.
+
+
+  METHOD get_status_text.
+
+    rv_status = SWITCH #( iv_type
+      WHEN 'S' THEN 'Success'
+      WHEN 'E' THEN 'Error'
+      WHEN 'W' THEN 'Warning'
+      WHEN 'I' THEN 'Info'
+      WHEN 'A' THEN 'Abort'
+      ELSE 'Unknown' ).
+
+  ENDMETHOD.
+
+
+  METHOD show_results.
+
+    IF mt_results IS INITIAL.
+      MESSAGE 'No results to display' TYPE 'S' DISPLAY LIKE 'W'.
+      RETURN.
+    ENDIF.
+
+    " Work with a copy so SALV can modify it
+    DATA: lt_display TYPE ty_result_tab.
+    lt_display = mt_results.
+
+    TRY.
+        DATA: lo_salv TYPE REF TO cl_salv_table.
+
+        cl_salv_table=>factory(
+          IMPORTING r_salv_table = lo_salv
+          CHANGING  t_table      = lt_display ).
+
+        " Functions
+        lo_salv->get_functions( )->set_all( abap_true ).
+
+        " Display settings
+        lo_salv->get_columns( )->set_optimize( abap_true ).
+        lo_salv->get_display_settings( )->set_striped_pattern( abap_true ).
+        lo_salv->get_display_settings( )->set_list_header( CONV #( iv_title ) ).
+
+        " Row colors
+        lo_salv->get_columns( )->set_color_column( 'COLOR' ).
+
+        " Column labels
+        DATA: lo_col TYPE REF TO cl_salv_column.
+
+        DEFINE set_col.
+          TRY.
+              lo_col = lo_salv->get_columns( )->get_column( &1 ).
+              lo_col->set_long_text( &2 ).
+              lo_col->set_medium_text( &3 ).
+              lo_col->set_short_text( &4 ).
+            CATCH cx_salv_not_found.
+          ENDTRY.
+        END-OF-DEFINITION.
+
+        set_col 'DOC_NUMBER' 'Document Number'   'Document No'    'Doc No'.
+        set_col 'DOC_YEAR'   'Fiscal Year'       'Fiscal Year'    'FY'.
+        set_col 'MATERIAL'   'Material'           'Material'       'Material'.
+        set_col 'VENDOR'     'Vendor'             'Vendor'         'Vendor'.
+        set_col 'PLANT'      'Plant'              'Plant'          'Plant'.
+        set_col 'MSG_TYPE'   'Msg Type'           'Msg Type'       'Type'.
+        set_col 'MSG_NUMBER' 'Msg Number'         'Msg No'         'MsgNo'.
+        set_col 'MSG_TEXT'   'Message'             'Message'        'Message'.
+        set_col 'STATUS'     'Status'              'Status'         'Status'.
+
+        " Hide color column and empty optional columns
+        TRY.
+            lo_salv->get_columns( )->get_column( 'COLOR' )->set_visible( abap_false ).
+
+            " Auto-hide columns that have no data
+            DATA(lv_has_vendor) = abap_false.
+            DATA(lv_has_plant)  = abap_false.
+            DATA(lv_has_mat)    = abap_false.
+
+            LOOP AT lt_display INTO DATA(ls_chk).
+              IF ls_chk-vendor IS NOT INITIAL.   lv_has_vendor = abap_true. ENDIF.
+              IF ls_chk-plant IS NOT INITIAL.    lv_has_plant  = abap_true. ENDIF.
+              IF ls_chk-material IS NOT INITIAL. lv_has_mat    = abap_true. ENDIF.
+              IF lv_has_vendor = abap_true AND lv_has_plant = abap_true AND lv_has_mat = abap_true.
+                EXIT.
+              ENDIF.
+            ENDLOOP.
+
+            IF lv_has_vendor = abap_false.
+              lo_salv->get_columns( )->get_column( 'VENDOR' )->set_visible( abap_false ).
+            ENDIF.
+            IF lv_has_plant = abap_false.
+              lo_salv->get_columns( )->get_column( 'PLANT' )->set_visible( abap_false ).
+            ENDIF.
+            IF lv_has_mat = abap_false.
+              lo_salv->get_columns( )->get_column( 'MATERIAL' )->set_visible( abap_false ).
+            ENDIF.
+
+          CATCH cx_salv_not_found.
+        ENDTRY.
+
+        " Sort
+        TRY.
+            lo_salv->get_sorts( )->add_sort(
+              columnname = 'DOC_NUMBER' subtotal = abap_true ).
+            lo_salv->get_sorts( )->add_sort(
+              columnname = 'MSG_TYPE'
+              sequence   = if_salv_c_sort=>sort_up ).
+          CATCH cx_salv_not_found cx_salv_existing cx_salv_data_error.
+        ENDTRY.
+
+        lo_salv->display( ).
+
+      CATCH cx_salv_msg INTO DATA(lx_salv).
+        MESSAGE lx_salv->get_text( ) TYPE 'E'.
+    ENDTRY.
+
+  ENDMETHOD.
+ENDCLASS.
