@@ -1,0 +1,173 @@
+REPORT zmm_mi05_upload.
+
+TYPES: BEGIN OF ty_mi05,
+         iblnr     TYPE iblnr,
+         gjahr     TYPE gjahr,
+         matnr     TYPE matnr18,
+         entry_qnt TYPE erfmg,
+         entry_uom TYPE erfme,
+       END OF ty_mi05.
+
+TYPES: BEGIN OF ty_result,
+         iblnr   TYPE iblnr,          " PI Document
+         gjahr   TYPE gjahr,          " Fiscal Year
+         matnr   TYPE matnr18,        " Material
+         type    TYPE bapi_mtype,     " S/E/W/I/A
+         number  TYPE symsgno,        " Message Number
+         message TYPE bapi_msg,       " Full Message Text
+         status  TYPE char10,         " Success / Error
+         color   TYPE lvc_t_scol,     " Row color
+       END OF ty_result.
+
+DATA: lt_result TYPE STANDARD TABLE OF ty_result,
+      lt_data   TYPE STANDARD TABLE OF ty_mi05,
+      lt_item   TYPE STANDARD TABLE OF bapi_physinv_count_items,
+      lt_return TYPE STANDARD TABLE OF bapiret2,
+      lv_index  TYPE numc3,
+      lv_tabix  TYPE sy-tabix.
+
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+  PARAMETERS: p_file TYPE rlgrap-filename .
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.
+  SELECTION-SCREEN PUSHBUTTON /1(40) pb_tmpl USER-COMMAND tmpl.
+SELECTION-SCREEN END OF BLOCK b2.
+
+INITIALIZATION.
+  pb_tmpl = TEXT-004.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  p_file = zcl_excel_upload=>file_open_dialog( ).
+
+AT SELECTION-SCREEN.
+  IF sy-ucomm = 'TMPL'.
+    PERFORM download_template.
+  ENDIF.
+
+START-OF-SELECTION.
+
+  IF p_file IS INITIAL.
+    MESSAGE TEXT-005 TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  TRY.
+      " Calling Reusable Class To get the Data From Excel
+      DATA(lo_excel) = NEW zcl_excel_upload( p_file ).
+      " Selection of Excel Sheet
+      DATA(lv_sheet) = lo_excel->show_sheet_popup( ).
+      IF lv_sheet IS INITIAL. RETURN. ENDIF.
+      " Processing the data From Excel to Internal Table
+      lo_excel->get_data(
+        EXPORTING iv_sheet_name = lv_sheet
+                  iv_skip_rows  = 1
+        IMPORTING et_data       = lt_data ).
+
+    CATCH cx_fdt_excel_core INTO DATA(lx).
+      MESSAGE lx->get_text( ) TYPE 'E'.
+      RETURN.
+  ENDTRY.
+
+  IF lt_data IS INITIAL.
+    MESSAGE TEXT-006 TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  " BAPI logic here
+
+  IF lt_data IS NOT INITIAL.
+    SORT lt_data BY iblnr.
+    DATA(lt_data1) = lt_data.
+    DELETE ADJACENT DUPLICATES FROM lt_data COMPARING iblnr.
+
+    LOOP AT lt_data INTO DATA(ls_data).
+      READ TABLE lt_data1 TRANSPORTING NO FIELDS
+          WITH KEY iblnr = ls_data-iblnr
+          BINARY SEARCH.
+
+      IF sy-subrc = 0.
+        lv_tabix = sy-tabix.
+
+        LOOP AT lt_data1 INTO DATA(ls_data1) FROM lv_tabix. "WHERE iblnr = ls_data-iblnr.
+          IF ls_data1-iblnr <> ls_data-iblnr.
+            EXIT.     " No more matches — break immediately
+          ENDIF.
+          lt_item = VALUE #( BASE lt_item (
+                                    item = |{ lv_index + 1 ALIGN = RIGHT WIDTH = 3 PAD = '0' }|
+                                    material = |{ ls_data1-matnr ALPHA = IN }|
+                                    entry_qnt = ls_data1-entry_qnt
+                                    entry_uom = ls_data1-entry_uom ) ).
+        ENDLOOP.
+      ENDIF.
+      CALL FUNCTION 'BAPI_MATPHYSINV_CHANGECOUNT'
+        EXPORTING
+          physinventory = ls_data-iblnr
+          fiscalyear    = ls_data-gjahr
+        TABLES
+          items         = lt_item
+          return        = lt_return.
+
+      " Check result and commit
+      READ TABLE lt_return WITH KEY type = 'E' TRANSPORTING NO FIELDS.
+      IF sy-subrc <> 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ENDIF.
+
+      " One line — logs ALL return messages with colors
+      lo_excel->add_bapi_return(
+        iv_doc_number = ls_data-iblnr
+        iv_doc_year   = ls_data-gjahr
+        iv_material   = ls_data-matnr
+        it_return     = lt_return ).
+
+
+      REFRESH : lt_item , lt_return.
+      CLEAR : ls_data , lv_index ,lv_tabix.
+
+    ENDLOOP.
+
+  ENDIF.
+
+  " One line — displays full color-coded SALV
+  lo_excel->show_results( CONV #( TEXT-003 ) ).
+
+*&---------------------------------------------------------------------*
+*& Form download_template
+*&---------------------------------------------------------------------*
+FORM download_template.
+  """Reusable Code to Download the Excel Tempelate
+  DATA: lt_fcat TYPE lvc_t_fcat,
+        lv_pos  TYPE i.
+
+  DEFINE add_col.
+    lv_pos += 1.
+    APPEND VALUE lvc_s_fcat(
+      fieldname = &1
+      coltext   = &2
+      col_pos   = lv_pos
+      dd_outlen = &3
+      inttype   = 'C'
+    ) TO lt_fcat.
+  END-OF-DEFINITION.
+
+  add_col 'IBLNR'     'Phys. Inv. Document'   10.
+  add_col 'GJAHR'     'Fiscal Year'            4.
+  add_col 'MATNR'     'Material Number'       18.
+  add_col 'ENTRY_QNT' 'Quantity'              13.
+  add_col 'ENTRY_UOM' 'Unit of Entry'          5.
+
+  TRY.
+      zcl_excel_upload=>download_template(
+        it_fieldcat = lt_fcat
+        iv_filename = CONV #( TEXT-007 ) ).
+    CATCH cx_salv_error INTO DATA(lx).
+      MESSAGE lx->get_text( ) TYPE 'S' DISPLAY LIKE 'E'.
+  ENDTRY.
+
+ENDFORM.
