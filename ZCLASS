@@ -78,11 +78,17 @@ CLASS zcl_excel_upload DEFINITION
 
       " Display result log as SALV
       show_results
-        IMPORTING iv_title TYPE string DEFAULT 'Upload Results'.
+        IMPORTING iv_title TYPE string DEFAULT 'Upload Results',
 
 
 
-
+      add_bdc_messages
+        IMPORTING iv_doc_number TYPE clike DEFAULT ''
+                  iv_doc_year   TYPE gjahr DEFAULT '0000'
+                  iv_material   TYPE matnr18 DEFAULT ''
+                  iv_vendor     TYPE lifnr DEFAULT ''
+                  iv_plant      TYPE werks_d DEFAULT ''
+                  it_messages   TYPE STANDARD TABLE.
 
     " Utility: F4 help for file selection (static — call before constructor)
     CLASS-METHODS :
@@ -118,7 +124,7 @@ ENDCLASS.
 
 
 
-CLASS ZCL_EXCEL_UPLOAD IMPLEMENTATION.
+CLASS zcl_excel_upload IMPLEMENTATION.
 
 
   METHOD constructor.
@@ -572,19 +578,20 @@ CLASS ZCL_EXCEL_UPLOAD IMPLEMENTATION.
               lo_col->set_long_text( &2 ).
               lo_col->set_medium_text( &3 ).
               lo_col->set_short_text( &4 ).
+              lo_col->set_visible(&5).
             CATCH cx_salv_not_found.
           ENDTRY.
         END-OF-DEFINITION.
 
-        set_col 'DOC_NUMBER' 'Document Number'   'Document No'    'Doc No'.
-        set_col 'DOC_YEAR'   'Fiscal Year'       'Fiscal Year'    'FY'.
-        set_col 'MATERIAL'   'Material'           'Material'       'Material'.
-        set_col 'VENDOR'     'Vendor'             'Vendor'         'Vendor'.
-        set_col 'PLANT'      'Plant'              'Plant'          'Plant'.
-        set_col 'MSG_TYPE'   'Msg Type'           'Msg Type'       'Type'.
-        set_col 'MSG_NUMBER' 'Msg Number'         'Msg No'         'MsgNo'.
-        set_col 'MSG_TEXT'   'Message'             'Message'        'Message'.
-        set_col 'STATUS'     'Status'              'Status'         'Status'.
+        set_col 'DOC_NUMBER' 'Document Number'   'Document No'    'Doc No' 'X'.
+        set_col 'DOC_YEAR'   'Fiscal Year'       'Fiscal Year'    'FY' 'X'.
+        set_col 'MATERIAL'   'Material'           'Material'       'Material' ' '.
+        set_col 'VENDOR'     'Vendor'             'Vendor'         'Vendor' ' '.
+        set_col 'PLANT'      'Plant'              'Plant'          'Plant' ' '.
+        set_col 'MSG_TYPE'   'Msg Type'           'Msg Type'       'Type' 'X'.
+        set_col 'MSG_NUMBER' 'Msg Number'         'Msg No'         'MsgNo' 'X'.
+        set_col 'MSG_TEXT'   'Message'             'Message'        'Message' 'X'.
+        set_col 'STATUS'     'Status'              'Status'         'Status' 'X'.
 
         " Hide color column and empty optional columns
         TRY.
@@ -634,4 +641,89 @@ CLASS ZCL_EXCEL_UPLOAD IMPLEMENTATION.
     ENDTRY.
 
   ENDMETHOD.
+
+  METHOD add_bdc_messages.
+
+    FIELD-SYMBOLS: <ls_msg> TYPE bdcmsgcoll.
+    DATA: lv_text TYPE bapi_msg.
+
+    IF it_messages IS INITIAL.
+      add_result(
+        iv_doc_number = iv_doc_number
+        iv_doc_year   = iv_doc_year
+        iv_material   = iv_material
+        iv_vendor     = iv_vendor
+        iv_plant      = iv_plant
+        iv_msg_type   = 'S'
+        iv_msg_text   = 'Processed successfully' ).
+      RETURN.
+    ENDIF.
+
+    LOOP AT it_messages ASSIGNING <ls_msg>.
+
+      " Skip info/warning — keep only S, E, A
+      CHECK <ls_msg>-msgtyp CA 'SEA'.
+
+      " Convert BDC message to readable text
+      CALL FUNCTION 'MASS_MESSAGE_GET'
+        EXPORTING
+          arbgb   = <ls_msg>-msgid
+          msgnr   = <ls_msg>-msgnr
+          msgv1   = <ls_msg>-msgv1
+          msgv2   = <ls_msg>-msgv2
+          msgv3   = <ls_msg>-msgv3
+          msgv4   = <ls_msg>-msgv4
+        IMPORTING
+          msgtext = lv_text
+        EXCEPTIONS
+          OTHERS  = 1.
+
+      IF sy-subrc <> 0 OR lv_text IS INITIAL.
+        lv_text = |{ <ls_msg>-msgid } { <ls_msg>-msgnr }: { <ls_msg>-msgv1 } { <ls_msg>-msgv2 }|.
+      ENDIF.
+
+      add_result(
+        iv_doc_number = iv_doc_number
+        iv_doc_year   = iv_doc_year
+        iv_material   = iv_material
+        iv_vendor     = iv_vendor
+        iv_plant      = iv_plant
+        iv_msg_type   = <ls_msg>-msgtyp
+        iv_msg_number = CONV #( <ls_msg>-msgnr )
+        iv_msg_text   = lv_text ).
+
+    ENDLOOP.
+
+    " If only W/I messages existed (all skipped), add them
+    DATA(lv_count) = REDUCE i( INIT c = 0
+      FOR ls IN mt_results WHERE ( doc_number = iv_doc_number )
+      NEXT c = c + 1 ).
+
+    IF lv_count = 0.
+      LOOP AT it_messages ASSIGNING <ls_msg>.
+        CALL FUNCTION 'MASS_MESSAGE_GET'
+          EXPORTING
+            arbgb   = <ls_msg>-msgid
+            msgnr   = <ls_msg>-msgnr
+            msgv1   = <ls_msg>-msgv1
+            msgv2   = <ls_msg>-msgv2
+            msgv3   = <ls_msg>-msgv3
+            msgv4   = <ls_msg>-msgv4
+          IMPORTING
+            msgtext = lv_text
+          EXCEPTIONS
+            OTHERS  = 1.
+
+        add_result(
+          iv_doc_number = iv_doc_number
+          iv_doc_year   = iv_doc_year
+          iv_material   = iv_material
+          iv_msg_type   = <ls_msg>-msgtyp
+          iv_msg_number = CONV #( <ls_msg>-msgnr )
+          iv_msg_text   = lv_text ).
+      ENDLOOP.
+    ENDIF.
+
+  ENDMETHOD.
+
 ENDCLASS.
